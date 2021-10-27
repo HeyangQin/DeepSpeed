@@ -57,6 +57,8 @@ from deepspeed.runtime.progressive_layer_drop import ProgressiveLayerDrop
 from deepspeed.runtime.utils import clip_grad_norm_
 from deepspeed.runtime.eigenvalue import Eigenvalue
 from deepspeed.runtime.data_pipeline.curriculum_scheduler import CurriculumScheduler
+from deepspeed.runtime.simigrad import SimiGrad
+
 
 from .pipe.module import PipelineModule
 from .utils import ensure_directory_exists, get_ma_status
@@ -346,6 +348,9 @@ class DeepSpeedEngine(Module):
             enable_global_timers=self.wall_clock_breakdown()
             or self.flops_profiler_enabled())
 
+        if self.simigrad_enabled():
+            self.simigrad =self._configure_simigrad()
+
         if self.global_rank == 0:
             self._config.print("DeepSpeedEngine configuration")
             if self.dump_state():
@@ -500,6 +505,57 @@ class DeepSpeedEngine(Module):
 
     def curriculum_params(self):
         return self._config.curriculum_params
+
+    def simigrad_enabled(self):
+        return self._config.simigrad_enabled
+
+    def tensorboard_enabled(self):
+        return self._config.tensorboard_enabled
+
+    def tensorboard_output_path(self):
+        return self._config.tensorboard_output_path
+
+    def tensorboard_job_name(self):
+        return self._config.tensorboard_job_name
+
+    def get_summary_writer(
+            self,
+            name="DeepSpeedJobName",
+            base=os.path.join(os.path.expanduser("~"),
+                              "tensorboard"),
+    ):
+        if self.tensorboard_output_path():
+            base_dir = self.tensorboard_output_path()
+            job_name = self.tensorboard_job_name()
+            log_dir = os.path.join(base_dir, job_name)
+        else:
+            if self.tensorboard_job_name():
+                name = self.tensorboard_job_name()
+
+            # Infrastructure-specific job-id
+            if "DLWS_JOB_ID" in os.environ:
+                infra_job_id = os.environ["DLWS_JOB_ID"]
+            elif "DLTS_JOB_ID" in os.environ:
+                infra_job_id = os.environ["DLTS_JOB_ID"]
+            else:
+                infra_job_id = "unknown-job-id"
+
+            summary_writer_dir_name = os.path.join(infra_job_id, "logs")
+            log_dir = os.path.join(base, summary_writer_dir_name, name)
+
+        os.makedirs(log_dir, exist_ok=True)
+        try:
+            # torch.utils.tensorboard will fail if `tensorboard` is not available,
+            # see their docs for more details: https://pytorch.org/docs/1.8.0/tensorboard.html
+            import tensorboard
+        except ImportError:
+            print(
+                'If you want to use tensorboard logging please `pip install tensorboard`'
+            )
+            raise
+        from torch.utils.tensorboard import SummaryWriter
+
+        return SummaryWriter(log_dir=log_dir)
 
     def wall_clock_breakdown(self):
         return self._config.wall_clock_breakdown
@@ -1429,6 +1485,9 @@ class DeepSpeedEngine(Module):
         scheduler = CurriculumScheduler(self.curriculum_params())
         return scheduler
 
+    def _configure_simigrad(self):
+        return SimiGrad(self)
+
     @staticmethod
     def is_map_style_dataset(obj):
         return hasattr(obj, "__getitem__") and hasattr(obj, "__len__")
@@ -1624,7 +1683,7 @@ class DeepSpeedEngine(Module):
             ranks=[0])
 
     @instrument_w_nvtx
-    def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE):
+    def allreduce_gradients(self, bucket_size=MEMORY_OPT_ALLREDUCE_SIZE, dp_group=None):
         assert not (self.bfloat16_enabled() and self.pipeline_parallelism), \
             f'allreduce_gradients() is not valid when bfloat+pipeline_parallelism is enabled'
 
@@ -1642,7 +1701,7 @@ class DeepSpeedEngine(Module):
                 self.optimizer.reduce_gradients(
                     pipeline_parallel=self.pipeline_parallelism)
             else:
-                self.buffered_allreduce_fallback(elements_per_buffer=bucket_size)
+                self.buffered_allreduce_fallback(elements_per_buffer=bucket_size,dp_group=dp_group)
 
     @instrument_w_nvtx
     def backward(self, loss, allreduce_gradients=True, release_loss=False):
@@ -1709,6 +1768,10 @@ class DeepSpeedEngine(Module):
 
         self._stop_timers(self.engine_timers.backward_inner_timers)
 
+        #simigrad
+        if self.is_gradient_accumulation_boundary() and self.simigrad_enabled():
+            self.simigrad.get_cosine_similarity()
+
         self._start_timers(self.engine_timers.backward_reduce_timers)
 
         if allreduce_gradients and self.enable_backward_allreduce:
@@ -1734,6 +1797,9 @@ class DeepSpeedEngine(Module):
         Returns:
             bool: if the current step is a gradient accumulation boundary.
         """
+        if self.simigrad_enabled():
+            return self.simigrad.is_gradient_accumulation_boundary()
+            
         if self._is_gradient_accumulation_boundary is None:
             return (self.micro_steps + 1) % \
                 self.gradient_accumulation_steps() == 0
@@ -1884,6 +1950,9 @@ class DeepSpeedEngine(Module):
             if self.progressive_layer_drop:
                 self.progressive_layer_drop.update_state(self.global_steps)
 
+            if self.simigrad_enabled():
+                self.simigrad.apply_lr_factor()
+
             if (self.eigenvalue_enabled() and not self.gas_boundary_ctr %
                     self.eigenvalue_gas_boundary_resolution()
                     and self.quantizer.any_precision_switch()):
@@ -1891,6 +1960,9 @@ class DeepSpeedEngine(Module):
             else:
                 self._take_model_step(lr_kwargs)
 
+            if self.simigrad_enabled():
+                self.simigrad.remove_lr_factor()
+                self.simigrad.update_batch_size()
         self.tput_timer.stop(report_progress)
 
         self._stop_timers(self.engine_timers.step_timers)
@@ -2134,15 +2206,15 @@ class DeepSpeedEngine(Module):
 
         return non_expert_grads, expert_grads
 
-    def _reduce_non_expert_gradients(self, grads, elements_per_buffer):
+    def _reduce_non_expert_gradients(self, grads, elements_per_buffer, dp_group=None):
         split_buckets = split_half_float_double_sparse(grads)
         for _, bucket_tuple in enumerate(split_buckets):
             bucket_type, bucket = bucket_tuple
-
-            if self.pipeline_parallelism:
-                dp_group = self.mpu.get_data_parallel_group()
-            else:
-                dp_group = groups._get_data_parallel_group()
+            if dp_group is None:
+                if self.pipeline_parallelism:
+                    dp_group = self.mpu.get_data_parallel_group()
+                else:
+                    dp_group = groups._get_data_parallel_group()
 
             if bucket_type == SparseTensor.type():
                 self.sparse_allreduce_no_retain(bucket, dp_group=dp_group)
@@ -2167,14 +2239,14 @@ class DeepSpeedEngine(Module):
                         dp_group=groups._get_expert_data_parallel_group(ep_name),
                         numel_per_bucket=elements_per_buffer)
 
-    def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000):
+    def buffered_allreduce_fallback(self, grads=None, elements_per_buffer=500000000,dp_group=None):
         if grads is None:
             non_expert_grads, expert_grads = self._get_gradients_for_reduction()
         else:
             assert not self.has_moe_layers, "attempting to reduce grads in unsupported way w.r.t. MoE"
             non_expert_grads = grads
 
-        self._reduce_non_expert_gradients(non_expert_grads, elements_per_buffer)
+        self._reduce_non_expert_gradients(non_expert_grads, elements_per_buffer,dp_group=dp_group)
 
         if self.has_moe_layers:
             self._reduce_expert_gradients(expert_grads, elements_per_buffer)

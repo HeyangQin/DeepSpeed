@@ -97,6 +97,24 @@ def get_curriculum_params(param_dict):
         return False
 
 
+def get_simigrad_enabled(param_dict):
+    if SIMIGRAD in param_dict.keys():
+        return get_scalar_param(param_dict[SIMIGRAD],
+                                SIMIGRAD_ENABLED,
+                                SIMIGRAD_ENABLED_DEFAULT)
+    else:
+        return False
+
+
+def get_simigrad_params(param_dict):
+    if SIMIGRAD in param_dict.keys():
+        simigrad_params = copy.copy(param_dict[SIMIGRAD])
+        simigrad_params.pop(SIMIGRAD_ENABLED)
+        return simigrad_params
+    else:
+        return False
+
+
 def get_pld_enabled(param_dict):
     if PROGRESSIVE_LAYER_DROP in param_dict.keys():
         return get_scalar_param(param_dict[PROGRESSIVE_LAYER_DROP],
@@ -939,6 +957,9 @@ class DeepSpeedConfig(object):
 
         self.curriculum_enabled = get_curriculum_enabled(param_dict)
         self.curriculum_params = get_curriculum_params(param_dict)
+
+        self.simigrad_enabled = get_simigrad_enabled(param_dict)
+        self.simigrad_params = get_simigrad_params(param_dict)
 
         checkpoint_params = get_checkpoint_params(param_dict)
         validation_mode = get_checkpoint_tag_validation_mode(checkpoint_params)

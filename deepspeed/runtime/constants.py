@@ -348,6 +348,16 @@ CURRICULUM_ENABLED = "enabled"
 CURRICULUM_ENABLED_DEFAULT = False
 
 
+
+#########################################
+# SimiGrad
+#########################################
+SIMIGRAD = "simigrad"
+
+SIMIGRAD_ENABLED = "enabled"
+SIMIGRAD_ENABLED_DEFAULT = False
+
+
 #########################################
 # Validation modes
 #########################################
