@@ -39,6 +39,19 @@ def create_two_half_groups_from_list(ranks_list):
             current_group=group
     return current_group
 
+
+def get_all_ranks_from_parallel_group(group):
+    rank=0
+    results=[]
+    try:
+        while True:
+            results.append(dist.distributed_c10d._get_global_rank(group, rank))
+            rank+=1
+    except RuntimeError:
+        pass
+    return results
+
+
 class NoAvailGradError(Exception):
     """No valid gradient is found. Usually due to overflow"""
     pass
@@ -78,28 +91,51 @@ class SimiGrad(object):
             else:
                 self.grad_passing_source=None
         else:
-            # According to mpu:
-            # Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
-            # use 2 GPUs to parallelize the model. The present function will
-            # create 4 model parallel groups and 2 data parallel grous as:
-            #     4 model parallel groups:
-            #         [g0, g1], [g2, g3], [g4, g5], [g6, g7]
-            #     2 data parallel groups:
-            #         [g0, g2, g4, g6], [g1, g3, g5, g7]
-            world_size = dist.get_world_size()
-            model_parallel_size=self.engine.mpu.get_model_parallel_world_size()
-            assert world_size>=model_parallel_size*2, "SimiGrad currently cannot work with model parallelism without data parallelism."
-            for i in range(model_parallel_size):
-                ranks = list(range(i, world_size, model_parallel_size))
-                group=create_two_half_groups_from_list(ranks)
-                self.dp_group=group if self.dp_group is None else self.dp_group
-                self.grad_passing_group=dist.new_group([ranks[0],ranks[-1]])
-                if self.grad_passing_source is None:
-                    if dist.get_rank() in [ranks[0],ranks[-1]]:
-                        self.grad_passing_source=ranks[-1]
-                    else:
-                        self.grad_passing_source=None
+            # # According to mpu:
+            # # Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
+            # # use 2 GPUs to parallelize the model. The present function will
+            # # create 4 model parallel groups and 2 data parallel grous as:
+            # #     4 model parallel groups:
+            # #         [g0, g1], [g2, g3], [g4, g5], [g6, g7]
+            # #     2 data parallel groups:
+            # #         [g0, g2, g4, g6], [g1, g3, g5, g7]
+            # world_size = dist.get_world_size()
+            # model_parallel_size=self.engine.mpu.get_model_parallel_world_size()
+            # assert world_size>=model_parallel_size*2, "SimiGrad currently cannot work with model parallelism without data parallelism."
+            # for i in range(model_parallel_size):
+            #     ranks = list(range(i, world_size, model_parallel_size))
+            #     group=create_two_half_groups_from_list(ranks)
+            #     self.dp_group=group if self.dp_group is None else self.dp_group
+            #     grad_passing_group=dist.new_group([ranks[0],ranks[-1]])
+            #     log_dist(f"SimiGrad created grad passing group for ranks {[ranks[0],ranks[-1]]}",ranks=[-1])
+            #     if dist.get_rank() in [ranks[0],ranks[-1]]:
+            #         self.grad_passing_source=ranks[-1]
+            #         self.grad_passing_group=grad_passing_group
             
+            #experimental code
+            world_size = dist.get_world_size()
+            known_replicas=[]
+            for target_rank in range(world_size):
+                if target_rank in known_replicas:
+                    continue
+                if dist.get_rank()==target_rank:
+                    local_replicas=get_all_ranks_from_parallel_group(self.engine.mpu.get_data_parallel_group())
+                    # log_dist(f"My current{local_replicas}",ranks=[-1])
+                    dist.broadcast(torch.Tensor(local_replicas).cuda().int(),dist.get_rank())
+                else:
+                    local_replicas=torch.Tensor(self.engine.mpu.get_data_parallel_world_size()).cuda().int()
+                    dist.broadcast(local_replicas,target_rank)
+                    local_replicas=local_replicas.tolist()
+                group=create_two_half_groups_from_list(local_replicas)
+                self.dp_group=group if self.dp_group is None else self.dp_group
+                grad_passing_group=dist.new_group([local_replicas[0],local_replicas[-1]])
+                log_dist(f"SimiGrad created grad passing group for ranks {[local_replicas[0],local_replicas[-1]]}",ranks=[0])
+                if dist.get_rank() in [local_replicas[0],local_replicas[-1]]:
+                    self.grad_passing_source=local_replicas[-1]
+                    self.grad_passing_group=grad_passing_group
+                known_replicas+=local_replicas
+                log_dist(f"So far SimiGrad has crated groups for ranks:{known_replicas}",ranks=[0])
+
         log_dist(f"SimiGrad grad passing source:{self.grad_passing_source}",ranks=[-1])
             
         # need to be initialized later because the model may be not initalized at this point
@@ -108,6 +144,10 @@ class SimiGrad(object):
         self.adjust_direction = 0
 
         log_dist(f'Enabled SimiGrad ({self.params})', ranks=[0])
+
+    def print_cosine_similarity(self,ranks=[0]):
+        log_dist(f"cosine {self.cos_placeholder.item()} computation at micro step {self.engine.micro_steps} takes {self.cosine_computation_time:.4f}s", ranks=ranks)
+
 
     def get_cosine_similarity(self):
         try:
@@ -125,55 +165,75 @@ class SimiGrad(object):
                 if self.grad_placeholder is None:
                     self.grad_placeholder = self.get_optimizer_grad(self.engine)
                 start_time = time.time()
+
                 if self.dp_group is not None:
                     self.engine.allreduce_gradients(dp_group=self.dp_group)
 
+                # # NaN handling
+                # try:
+                #     assert torch.all(torch.isfinite(self.get_optimizer_grad(self.engine)))
+                # except:
+                #     log_dist("There are nan in SimiGrad half allreduced values",ranks=[-1])
+                #     log_dist(torch.mean(torch.isfinite(self.get_optimizer_grad(self.engine)).float()),ranks=[-1])
+
+                # dist.barrier()
+                local_grad=self.get_optimizer_grad(self.engine)
                 if self.grad_passing_source is not None:
                     if self.engine.global_rank == self.grad_passing_source:
-                        dist.broadcast(self.get_optimizer_grad(self.engine), self.grad_passing_source, group=self.grad_passing_group)
+                        # # NaN handling
+                        # try:
+                        #     assert torch.all(torch.isfinite(self.get_optimizer_grad(self.engine)))
+                        # except:
+                        #     log_dist("There are nan before SimiGrad half allreduced values",ranks=[-1])
+                        dist.broadcast(local_grad, self.grad_passing_source, group=self.grad_passing_group)
+                        # log_dist(f"Sending grads from {self.grad_passing_source}, total number {self.get_optimizer_grad(self.engine).numel()}",ranks=[-1])
                     else:
                         dist.broadcast(self.grad_placeholder, self.grad_passing_source, group=self.grad_passing_group)
+                        # log_dist(f"Got grads from {self.grad_passing_source}, total number {self.grad_placeholder.numel()}",ranks=[-1])
+                # dist.barrier()
+
+                # # NaN handling
+                # if self.grad_placeholder is not None and self.grad_passing_source is not None and self.engine.global_rank != self.grad_passing_source:
+                #     try:
+                #         assert torch.all(torch.isfinite(self.grad_placeholder))
+                #     except:
+                #         log_dist("There are nan in the half allreduced values other half receives",ranks=[-1])
+                #         log_dist(["Source dtype",self.get_optimizer_grad(self.engine).dtype,"Receiver dtype",self.grad_placeholder.dtype,"Percentage",torch.mean(torch.isfinite(self.grad_placeholder).float()),"Number",""],ranks=[-1])
+
                 if self.engine.mpu is None:
                     if self.engine.global_rank == 0:
-                        # NaN handling
-                        # try:
-                        #     assert torch.all(torch.isfinite(self.get_optimizer_grad(self.engine).double()))
-                        #     assert torch.all(torch.isfinite(self.grad_placeholder.double()))
-                        # except:
-                        #     log_dist("There are nan in SimiGrad half allreduced values",ranks=[-1])
-                            # log_dist(torch.mean(torch.isfinite(self.get_optimizer_grad(self.engine).double()).float()),ranks=[-1])
-                            # log_dist(torch.mean(torch.isfinite(self.grad_placeholder.double()).float()),ranks=[-1])
                         # t1=self.get_optimizer_grad(self.engine).double()
                         # t2=self.grad_placeholder.double()
                         # finite_mask=torch.logical_and(torch.isfinite(t1),torch.isfinite(t2))
                         # self.cos_placeholder = torch.nn.functional.cosine_similarity(t1[finite_mask], t2[finite_mask], dim=0)
 
-                        self.cos_placeholder = torch.nn.functional.cosine_similarity(self.get_optimizer_grad(self.engine).float(), self.grad_placeholder.float(), dim=0)
-                        self.cos_placeholder=self.cos_placeholder
+                        self.cos_placeholder = torch.nn.functional.cosine_similarity(local_grad.float(), self.grad_placeholder.float(), dim=0)
                 else:
                     if self.grad_passing_source is not None and self.engine.global_rank != self.grad_passing_source:
-                        grad_dot=torch.dot(self.get_optimizer_grad(self.engine).float(),self.grad_placeholder.float())
-                        norm_first_half=torch.sum(torch.square(self.get_optimizer_grad(self.engine).float()))
+                        grad_dot=torch.dot(local_grad.float(),self.grad_placeholder.float())
+                        norm_first_half=torch.sum(torch.square(local_grad.float()))
                         norm_second_half=torch.sum(torch.square(self.grad_placeholder.float()))
-                        log_dist([grad_dot,norm_first_half,norm_second_half],ranks=[-1])
-                        tensor_list = [torch.zeros(3).float().cuda() for _ in range(self.engine.mpu.get_model_parallel_world_size())]
-                        dist.all_gather(tensor_list=tensor_list, tensor=torch.stack([grad_dot,norm_first_half,norm_second_half]),group=self.engine.mpu.get_model_parallel_group())
+                        # log_dist([grad_dot,norm_first_half,norm_second_half],ranks=[-1])
+                        tensor_list = [torch.zeros(3).cuda().float() for _ in range(self.engine.mpu.get_model_parallel_world_size())]
+                        dist.all_gather(tensor_list=tensor_list, tensor=torch.stack([grad_dot.float(),norm_first_half.float(),norm_second_half.float()]),group=self.engine.mpu.get_model_parallel_group())
                     if dist.get_rank()==0:
                         grad_dot=torch.Tensor([0]).double().cuda()
                         norm_first_half=torch.Tensor([0]).double().cuda()
                         norm_second_half=torch.Tensor([0]).double().cuda()
                         for cosine_scatter in tensor_list:
-                            grad_dot+=cosine_scatter[0]/100000000
-                            norm_first_half+=cosine_scatter[1]/100000000
-                            norm_second_half+=cosine_scatter[2]/100000000
+                            grad_dot+=cosine_scatter[0]
+                            norm_first_half+=cosine_scatter[1]
+                            norm_second_half+=cosine_scatter[2]
+                        # log_dist([grad_dot,norm_first_half,norm_second_half],ranks=[-1])
                         self.cos_placeholder=grad_dot/torch.sqrt(norm_first_half)/torch.sqrt(norm_second_half)
 
                 self.cos_placeholder=self.cos_placeholder.float()
                 dist.broadcast(self.cos_placeholder, 0)
                 # if not torch.all(torch.isfinite(self.cos_placeholder)):
                 #     self.skip_cos_computation=True
-                log_dist(
-                    f"cosine {self.cos_placeholder.item()} computation at micro step {self.engine.micro_steps} takes {time.time()-start_time}", ranks=[0])
+                # log_dist(
+                    # f"cosine {self.cos_placeholder.item()} computation at micro step {self.engine.micro_steps} takes {time.time()-start_time}", ranks=[0])
+                self.cosine_computation_time=time.time()-start_time
         except NoAvailGradError:
             log_dist("Skipping SimiGrad cosince computation as there's no available gradient.",ranks=[0])
             return
