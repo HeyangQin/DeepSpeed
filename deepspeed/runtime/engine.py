@@ -1856,11 +1856,16 @@ class DeepSpeedEngine(Module):
                 clip_grad_norm_(parameters=master_params,
                                 max_norm=self.gradient_clipping(),
                                 mpu=self.mpu)
-        self.optimizer.step()
 
         if hasattr(self.optimizer, '_global_grad_norm'):
             self._global_grad_norm = self.optimizer._global_grad_norm
 
+        if self.simigrad_enabled():
+            self.simigrad.apply_lr_factor()
+        self.optimizer.step()
+        if self.simigrad_enabled():
+            self.simigrad.remove_lr_factor()
+            
         # Quantize the updated parameter if there is no overflow
         if self.quantizer:
             if self.fp16_enabled():
@@ -1950,8 +1955,6 @@ class DeepSpeedEngine(Module):
             if self.progressive_layer_drop:
                 self.progressive_layer_drop.update_state(self.global_steps)
 
-            if self.simigrad_enabled():
-                self.simigrad.apply_lr_factor()
 
             if (self.eigenvalue_enabled() and not self.gas_boundary_ctr %
                     self.eigenvalue_gas_boundary_resolution()
@@ -1961,7 +1964,6 @@ class DeepSpeedEngine(Module):
                 self._take_model_step(lr_kwargs)
 
             if self.simigrad_enabled():
-                self.simigrad.remove_lr_factor()
                 self.simigrad.update_batch_size()
         self.tput_timer.stop(report_progress)
 
