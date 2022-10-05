@@ -39,10 +39,11 @@ zero_init_enabled = False
 
 
 def _dist_allgather_fn(input_tensor: Tensor, output_tensor: Tensor, group=None):
-    return instrument_w_nvtx(dist.allgather_fn)(output_tensor,
-                                                input_tensor,
-                                                group=group,
-                                                async_op=True)
+    raise NotImplementedError
+    # return instrument_w_nvtx(dist.allgather_fn)(output_tensor,
+    #                                             input_tensor,
+    #                                             group=group,
+    #                                             async_op=True)
 
 
 def print_rank_0(message, debug=False, force=False):
@@ -477,7 +478,7 @@ class AllGatherHandle:
         self.__param = param
 
     def wait(self) -> None:
-        instrument_w_nvtx(self.__handle.wait)()
+        # instrument_w_nvtx(self.__handle.wait)()
         self.__param.ds_status = ZeroParamStatus.AVAILABLE
 
 
@@ -505,7 +506,7 @@ class AllGatherCoalescedHandle:
         if self.__complete:
             return
 
-        instrument_w_nvtx(self.__allgather_handle.wait)()
+        # instrument_w_nvtx(self.__allgather_handle.wait)()
 
         # split the single tensor out into individual tensors
         param_offset = 0
@@ -800,7 +801,8 @@ class Init(InsertPostInitMethodToModuleSubClasses):
             cls = param
             if param_list is None:
                 param_list = [cls]
-            return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
+            # return self._all_gather(param_list, async_op=async_op, hierarchy=hierarchy)
+            return None
 
         @instrument_w_nvtx
         def all_gather_coalesced(params: Iterable[Parameter],
@@ -842,10 +844,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                     device=torch.cuda.current_device(),
                     requires_grad=False,
                 )
-                handle = _dist_allgather_fn(
-                    param.ds_tensor.to(torch.cuda.current_device()),
-                    param_buffer,
-                    self.ds_process_group)
+                # handle = _dist_allgather_fn(
+                #     param.ds_tensor.to(torch.cuda.current_device()),
+                #     param_buffer,
+                #     self.ds_process_group)
+                handle = None
                 param.data = param_buffer.narrow(0,
                                                  0,
                                                  param.ds_numel).view(param.ds_shape).to(
@@ -868,9 +871,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 instrument_w_nvtx(torch.cat)(
                     [p.ds_tensor.to(torch.cuda.current_device()) for p in params],
                     out=partitions[self.rank])
-                handle = _dist_allgather_fn(partitions[self.rank],
-                                            flat_tensor,
-                                            self.ds_process_group)
+                # handle = _dist_allgather_fn(partitions[self.rank],
+                #                             flat_tensor,
+                #                             self.ds_process_group)
+                handle = None
 
                 return AllGatherCoalescedHandle(
                     allgather_handle=handle,
@@ -1006,9 +1010,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         for param in param_list:
             if param.ds_status == ZeroParamStatus.NOT_AVAILABLE:
                 if async_op:
-                    handle = self._allgather_param(param,
-                                                   async_op=async_op,
-                                                   hierarchy=hierarchy)
+                    # handle = self._allgather_param(param,
+                    #                                async_op=async_op,
+                    #                                hierarchy=hierarchy)
+                    handle = None
                     param.ds_status = ZeroParamStatus.INFLIGHT  # if async_op else ZeroParamStatus.AVAILABLE
                     handles.append(handle)
                 else:
@@ -1208,10 +1213,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
         #            return None
         if self.use_all_gather_base:
             # try the _all_gather_base on PyTorch master branch
-            handle = dist.all_gather_base(flat_tensor,
-                                          param.ds_tensor.cuda(),
-                                          group=self.ds_process_group,
-                                          async_op=async_op)
+            # handle = dist.all_gather_base(flat_tensor,
+            #                               param.ds_tensor.cuda(),
+            #                               group=self.ds_process_group,
+            #                               async_op=async_op)
+            handle = None
         else:
             partitions = []
             for i in range(self.world_size):
@@ -1223,10 +1229,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                 if i == dist.get_rank(group=self.ds_process_group):
                     partitions[i].data.copy_(param.ds_tensor.data, non_blocking=True)
 
-            handle = dist.all_gather(partitions,
-                                     partitions[self.rank],
-                                     group=self.ds_process_group,
-                                     async_op=async_op)
+            # handle = dist.all_gather(partitions,
+            #                          partitions[self.rank],
+            #                          group=self.ds_process_group,
+            #                          async_op=async_op)
+            handle = None
 
         replicated_tensor = flat_tensor.narrow(0, 0, param.ds_numel).view(param.ds_shape)
         param.data = replicated_tensor.data
@@ -1264,10 +1271,11 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
             if self.use_all_gather_base:
                 # try the _all_gather_base from Pytorch master
-                h = dist.all_gather_base(allgather_params[param_idx],
-                                         input_tensor,
-                                         group=self.ds_process_group,
-                                         async_op=True)
+                # h = dist.all_gather_base(allgather_params[param_idx],
+                #                          input_tensor,
+                #                          group=self.ds_process_group,
+                #                          async_op=True)
+                h = None
             else:
                 output_list = []
                 for i in range(self.world_size):
@@ -1280,14 +1288,15 @@ class Init(InsertPostInitMethodToModuleSubClasses):
                         )
 
                 # back to old all_gather function signature
-                h = dist.all_gather(output_list,
-                                    input_tensor,
-                                    group=self.ds_process_group,
-                                    async_op=True)
+                # h = dist.all_gather(output_list,
+                #                     input_tensor,
+                #                     group=self.ds_process_group,
+                #                     async_op=True)
+                h = None
             launch_handles.append(h)
 
         # Wait ensures the operation is enqueued, but not necessarily complete.
-        launch_handles[-1].wait()
+        # launch_handles[-1].wait()
 
         # assign to param.data (not copy)
         for i, param in enumerate(param_list):
@@ -1329,10 +1338,10 @@ class Init(InsertPostInitMethodToModuleSubClasses):
 
                     offset += param_numel
 
-        dist.all_gather(partitions,
-                        partitions[self.rank],
-                        group=self.ds_process_group,
-                        async_op=False)
+        # dist.all_gather(partitions,
+        #                 partitions[self.rank],
+        #                 group=self.ds_process_group,
+        #                 async_op=False)
         param_offset = 0
 
         for param in param_list:
